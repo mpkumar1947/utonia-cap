@@ -75,6 +75,7 @@ def run_inference(
     prompt: str = "Describe the 3D scene in detail.",
     device: str = None,
     grid_size: float = 0.5,
+    lora_adapter: str = None,
 ) -> str:
     import gc
     if device is None:
@@ -169,6 +170,13 @@ def run_inference(
     )
     llm.eval()
 
+    # Load LoRA adapters if Stage 2 checkpoint provided
+    if lora_adapter and os.path.exists(lora_adapter):
+        from peft import PeftModel
+        llm = PeftModel.from_pretrained(llm, lora_adapter)
+        llm.eval()
+        print(f"  ✓ LoRA adapter loaded from {lora_adapter}")
+
     prompt_text = (
         "<|im_start|>system\nYou are a helpful 3D scene understanding assistant. "
         "Geometric tokens have been embedded into your input representing a real 3D point cloud. "
@@ -224,6 +232,8 @@ if __name__ == "__main__":
                         help="Path to trained projector checkpoint")
     parser.add_argument("--prompt", default="describe",
                         help=f"Prompt preset or custom text. Presets: {list(PROMPT_PRESETS.keys())}")
+    parser.add_argument("--lora-adapter", default=None,
+                        help="Path to LoRA adapter dir from Stage 2 (optional)")
     parser.add_argument("--grid-size", type=float, default=0.5)
     parser.add_argument("--interactive", action="store_true",
                         help="Run multiple prompts interactively")
@@ -235,7 +245,6 @@ if __name__ == "__main__":
 
     if args.interactive:
         print("\nInteractive mode — type prompts, 'quit' to exit, 'list' to see presets")
-        # Load model once
         while True:
             user_prompt = input("\nPrompt > ").strip()
             if user_prompt.lower() == "quit":
@@ -245,6 +254,8 @@ if __name__ == "__main__":
                     print(f"  {k}: {v}")
                 continue
             resolved = PROMPT_PRESETS.get(user_prompt, user_prompt)
-            run_inference(args.input, args.checkpoint, resolved, device, args.grid_size)
+            run_inference(args.input, args.checkpoint, resolved, device,
+                         args.grid_size, args.lora_adapter)
     else:
-        run_inference(args.input, args.checkpoint, prompt, device, args.grid_size)
+        run_inference(args.input, args.checkpoint, prompt, device,
+                     args.grid_size, args.lora_adapter)

@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--stage1-checkpoint", default="checkpoints/stage1_best.pt",
                         help="Path to Stage 1 projector checkpoint")
     parser.add_argument("--data", default="augmented",
-                        choices=["augmented", "cap3d", "scanrefer"])
+                        choices=["augmented", "rich", "cap3d", "scanrefer"])
     parser.add_argument("--data-dir", default=os.path.expanduser("~/.cache/utonia"))
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=2e-4,
