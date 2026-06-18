@@ -48,7 +48,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Utonia-Cap")
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2])
     parser.add_argument("--data", type=str, default="synthetic",
-                        choices=["synthetic", "augmented", "cap3d", "scanrefer"])
+                        choices=["synthetic", "augmented", "rich", "cap3d", "scanrefer"])
     parser.add_argument("--data-dir", type=str,
                         default=os.path.expanduser("~/.cache/utonia"))
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -77,6 +77,17 @@ def get_dataset(args):
         if args.debug:
             sample_files = sample_files * 20  # repeat to get enough steps
         return SyntheticPointCloudDataset(sample_files)
+    elif args.data == "rich":
+        aug_dir = os.path.join(args.data_dir, "augmented")
+        cap3d_csv = os.path.join(args.data_dir, "cap3d", "Cap3D_automated_Objaverse_full.csv")
+        if not os.path.exists(aug_dir):
+            raise FileNotFoundError(
+                f"Run augmentation first: python utonia_cap/download_cap3d.py --mode augment"
+            )
+        from utonia_cap.dataset_cap3d_inject import RichSyntheticDataset
+        aug_files = [os.path.join(aug_dir, f) for f in os.listdir(aug_dir) if f.endswith(".npz")]
+        print(f"Rich dataset: {len(aug_files)} scenes + Cap3D style injection")
+        return RichSyntheticDataset(aug_files, cap3d_csv=cap3d_csv)
     elif args.data == "augmented":
         aug_dir = os.path.join(args.data_dir, "augmented")
         if not os.path.exists(aug_dir):
