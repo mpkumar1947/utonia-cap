@@ -192,11 +192,14 @@ class UtoniaCap(nn.Module):
         # Cast geometry tokens to match LLM dtype (bfloat16) — projector outputs float32
         geo_tokens = geo_tokens.to(dtype=prompt_embeds.dtype)
 
+        # Expand prompt to match batch size of geo_tokens (e.g. batch_size=2)
+        batch_size = geo_tokens.shape[0]
+        prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)  # [B, prompt_len, 1536]
+
         # Step 3: Concatenate [prompt] + [geometry tokens] as input
         # The LLM "reads" the geometry tokens as if they were words
         input_embeds = torch.cat([prompt_embeds, geo_tokens], dim=1)
-        # Shape: [1, prompt_len + 32, 1536]
-
+        # Shape: [B, prompt_len + 32, 1536]
 
         if caption_ids is not None:
             # ── Training Mode ─────────────────────────────────────────────
@@ -208,7 +211,7 @@ class UtoniaCap(nn.Module):
             # We only want loss on the caption tokens, not the prompt/geometry
             prefix_len = prompt_embeds.shape[1] + self.num_queries
             labels = torch.full(
-                (1, input_embeds.shape[1]),
+                (batch_size, input_embeds.shape[1]),
                 fill_value=-100,
                 dtype=torch.long,
                 device=self.device_str,
@@ -220,6 +223,7 @@ class UtoniaCap(nn.Module):
                 labels=labels,
             )
             return outputs.loss
+
 
         else:
             # ── Inference Mode ────────────────────────────────────────────
