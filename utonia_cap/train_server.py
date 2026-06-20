@@ -1,144 +1,153 @@
 """
 Unified End-to-End Training for the Remote Server.
-Loads Utonia (frozen) and Qwen (LoRA) simultaneously on GPU 0.
-Uses gradient accumulation to simulate large batch sizes while fitting in 8GB VRAM.
+Uses UtoniaCap (the actual model class from model.py) with LoRA enabled.
+Trains on full Cap3D dataset (660K objects) streaming from zip files.
+Runs on GPU 0 with gradient accumulation to simulate large batches.
 """
 
 import os
+import sys
 import argparse
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Ensure PYTHONPATH is set correctly
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import utonia
 from utonia_cap.dataset import Cap3DDataset, collate_fn
-from utonia_cap.model import UtoniaCapPipeline
-from utonia_cap.projector import SimpleCrossAttentionProjector
+from utonia_cap.model import UtoniaCap
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, TaskType
 
 def train_server(args):
-    # Set device to GPU 0 (the free 8GB GPU on the server)
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-    # 1. Dataset
-    print(f"Loading Cap3D dataset from zip files...")
+    # 1. Load Dataset
+    print(f"\nLoading Cap3D dataset from: {args.data_dir}")
     dataset = Cap3DDataset(args.data_dir, split="train", max_points=args.max_points)
-    # Batch size 2 is safe for 8GB VRAM when both models are loaded
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
-    # 2. Utonia Backbone (Frozen)
-    print("Loading Utonia backbone...")
-    encoder = utonia.model.default(pretrained=args.utonia_ckpt)
-    encoder = encoder.to(device)
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
+    if len(dataset) == 0:
+        print("ERROR: Dataset is empty! Check the data_dir path and CSV file.")
+        return
 
-    # 3. Projector (Trainable)
-    print("Initializing Projector...")
-    projector = SimpleCrossAttentionProjector(
-        in_dim=576,   # Utonia features
-        out_dim=1536, # Qwen2.5-1.5B embed_dim
-        num_heads=8,
-        num_query_tokens=64
+    # num_workers=0 avoids multiprocessing issues with zip file handles
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
     )
-    projector = projector.to(device)
-    projector.train()
+    print(f"Dataloader ready: {len(dataset):,} objects, {len(dataloader):,} batches/epoch")
 
-    # 4. LLM with LoRA (Trainable)
-    print("Loading LLM (Qwen2.5-1.5B) and injecting LoRA adapters...")
-    llm_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(llm_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load in bfloat16 to save memory
-    llm = AutoModelForCausalLM.from_pretrained(llm_name, torch_dtype=torch.bfloat16)
-    
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=8,
+    # 2. Build the Full Model (UtoniaCap with LoRA enabled)
+    print("\nBuilding UtoniaCap model with LoRA...")
+    model = UtoniaCap(
+        utonia_ckpt=args.utonia_ckpt,
+        llm_name="Qwen/Qwen2.5-1.5B-Instruct",
+        num_queries=32,
+        freeze_utonia=True,
+        use_lora=True,          # Enable LoRA adapters for LLM
+        lora_rank=8,
         lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
+        device=device,
     )
-    llm = get_peft_model(llm, lora_config)
-    llm = llm.to(device)
-    llm.train()
-    llm.print_trainable_parameters()
+    model.projector.train()
+    model.llm.train()
 
-    # 5. Pipeline
-    pipeline = UtoniaCapPipeline(encoder, projector, llm, tokenizer)
-    pipeline.train()
+    trainable = model.trainable_param_count()
+    print(f"Trainable parameters: {trainable / 1e6:.1f}M")
 
-    # Optimizer (only train projector and LoRA parameters)
-    trainable_params = list(projector.parameters()) + list(llm.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    # 3. Optimizer (only trainable params — projector + LoRA)
+    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr)
 
-    print(f"Starting End-to-End Server Training for {args.epochs} epochs!")
-    
+    # 4. Training Loop
     os.makedirs(args.out_dir, exist_ok=True)
-    
     accumulation_steps = args.accumulate
-    
+    print(f"\nStarting training: {args.epochs} epochs, batch_size={args.batch_size}, "
+          f"grad_accum={accumulation_steps} (effective batch={args.batch_size * accumulation_steps})")
+
     for epoch in range(args.epochs):
-        total_loss = 0
+        total_loss = 0.0
+        n_batches = 0
         optimizer.zero_grad()
-        
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for step, (point_dict, captions) in enumerate(pbar):
-            # Move points to device
+            # Move point cloud tensors to GPU
             for k, v in point_dict.items():
                 if isinstance(v, torch.Tensor):
                     point_dict[k] = v.to(device)
 
-            # E2E Forward Pass
+            # Tokenize captions
+            caption_enc = model.tokenizer(
+                captions,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=128,
+            )
+            caption_ids = caption_enc.input_ids.to(device)
+
             try:
-                loss = pipeline(point_dict, captions)
-                
-                # Normalize loss to account for accumulation
+                # End-to-end forward pass → returns loss
+                loss = model(point_dict, caption_ids=caption_ids)
+
+                # Normalize for gradient accumulation
                 loss = loss / accumulation_steps
                 loss.backward()
-                
+
                 if (step + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
-                    
+
                 total_loss += loss.item() * accumulation_steps
-                pbar.set_postfix(loss=f"{loss.item() * accumulation_steps:.4f}")
-                
+                n_batches += 1
+                pbar.set_postfix(
+                    loss=f"{loss.item() * accumulation_steps:.4f}",
+                    gpu=f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
+                )
+
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"OOM on step {step}. Emptying cache and skipping batch.")
+                    print(f"\nOOM on step {step}. Skipping batch and clearing cache.")
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
                 else:
                     raise e
-            
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
-        
-        # Save checkpoints
-        torch.save(projector.state_dict(), os.path.join(args.out_dir, f"projector_e2e_epoch{epoch+1}.pt"))
-        llm.save_pretrained(os.path.join(args.out_dir, "lora_adapter_e2e"))
-        print(f"Saved checkpoint for Epoch {epoch+1}")
+
+        avg_loss = total_loss / max(n_batches, 1)
+        print(f"\n✓ Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
+
+        # Save checkpoint
+        proj_path = os.path.join(args.out_dir, f"projector_server_epoch{epoch+1}.pt")
+        lora_path = os.path.join(args.out_dir, "lora_adapter_server")
+        torch.save(model.projector.state_dict(), proj_path)
+        model.llm.save_pretrained(lora_path)
+        print(f"  Saved → {proj_path}")
+        print(f"  Saved → {lora_path}/")
+
+    print("\n✓ Training complete!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/mnt/zone_b/Datasets/utonia_cap")
-    parser.add_argument("--utonia_ckpt", type=str, default="./ckpt/utonia.pth")
-    parser.add_argument("--out_dir", type=str, default="./checkpoints")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--accumulate", type=int, default=16, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--max_points", type=int, default=60000, help="Cap points to save VRAM")
+    parser.add_argument("--data_dir",    type=str,   default="/mnt/zone_b/Datasets/utonia_cap/PointCloud_pt_zips")
+    parser.add_argument("--utonia_ckpt", type=str,   default="./ckpt/utonia.pth")
+    parser.add_argument("--out_dir",     type=str,   default="./checkpoints")
+    parser.add_argument("--epochs",      type=int,   default=5)
+    parser.add_argument("--batch_size",  type=int,   default=1)
+    parser.add_argument("--accumulate",  type=int,   default=16)
+    parser.add_argument("--lr",          type=float, default=1e-4)
+    parser.add_argument("--max_points",  type=int,   default=60000)
     args = parser.parse_args()
-    
     train_server(args)
