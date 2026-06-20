@@ -149,48 +149,78 @@ class SyntheticPointCloudDataset(Dataset):
 class Cap3DDataset(Dataset):
     """
     Cap3D: 660K ShapeNet object captions.
-    Download: huggingface.co/datasets/tiange/Cap3D
-
-    Each item:
-        point_dict:  ShapeNet object point cloud (coord, color, normal)
-        caption:     Human-written + GPT-refined description
-
-    Example captions:
-        "A wooden armchair with blue cushions and carved armrests."
-        "A modern desk lamp with an adjustable neck and circular base."
+    Dataset that reads directly from the downloaded ZIP files. No extraction needed!
     """
 
-    def __init__(self, data_dir: str, split: str = "train", max_points: int = 8192):
+    def __init__(self, data_dir: str, split: str = "train", max_points: int = 80000):
+        import zipfile
+        import glob
+        
         self.data_dir = data_dir
         self.max_points = max_points
-        self.transform = utonia.transform.default(4.0)  # Object-scale grid size
-
-        # Load captions CSV
+        self.transform = utonia.transform.default(4.0)
+        
+        # 1. Load captions CSV
         caption_file = os.path.join(data_dir, f"Cap3D_automated_Objaverse_no3Dword_{split}.csv")
         if not os.path.exists(caption_file):
-            raise FileNotFoundError(
-                f"Cap3D captions not found at {caption_file}\n"
-                f"Run: python utonia_cap/dataset.py --download cap3d"
-            )
+            alt_path = os.path.join(data_dir, "Cap3D_automated_Objaverse_no3Dword.csv")
+            if os.path.exists(alt_path):
+                caption_file = alt_path
+            else:
+                print(f"Warning: Cap3D caption CSV not found in {data_dir}. Ensure it is downloaded.")
+                caption_file = None
 
+        # 2. Map contents of all zip files
+        self.zip_paths = glob.glob(os.path.join(data_dir, "compressed_pcs_pt_*.zip"))
+        if not self.zip_paths:
+            print(f"Warning: No zip files found in {data_dir}. Did the download complete?")
+            self.uid_to_zip = {}
+        else:
+            print(f"Indexing {len(self.zip_paths)} zip files. This takes ~15 seconds...")
+            self.uid_to_zip = {}
+            for zpath in self.zip_paths:
+                with zipfile.ZipFile(zpath, 'r') as zf:
+                    for name in zf.namelist():
+                        if name.endswith('.pt'):
+                            uid = os.path.splitext(os.path.basename(name))[0]
+                            self.uid_to_zip[uid] = (zpath, name)
+
+        # 3. Match captions to available zip files
         self.items = []
-        with open(caption_file) as f:
-            for line in f:
-                parts = line.strip().split(",", 1)
-                if len(parts) == 2:
-                    uid, caption = parts
-                    ply_path = os.path.join(data_dir, "pointclouds", f"{uid}.pt")
-                    if os.path.exists(ply_path):
-                        self.items.append((ply_path, caption.strip('"')))
-
-        print(f"Cap3DDataset ({split}): {len(self.items):,} objects loaded")
+        if caption_file and self.uid_to_zip:
+            missing = 0
+            with open(caption_file) as f:
+                for line in f:
+                    parts = line.strip().split(",", 1)
+                    if len(parts) == 2:
+                        uid, caption = parts
+                        uid = uid.strip()
+                        if uid in self.uid_to_zip:
+                            self.items.append((uid, caption.strip('"')))
+                        else:
+                            missing += 1
+            print(f"Cap3DDataset ({split}): {len(self.items):,} objects mapped. {missing} missing from zips.")
+        
+        # Lazy zip handlers for multiprocessing dataloader workers
+        self._zip_handlers = {}
 
     def __len__(self):
         return len(self.items)
 
+    def _get_zip(self, zip_path):
+        import zipfile
+        if zip_path not in self._zip_handlers:
+            self._zip_handlers[zip_path] = zipfile.ZipFile(zip_path, 'r')
+        return self._zip_handlers[zip_path]
+
     def __getitem__(self, idx: int):
-        ply_path, caption = self.items[idx]
-        data = torch.load(ply_path, weights_only=False)
+        import io
+        uid, caption = self.items[idx]
+        zpath, internal_name = self.uid_to_zip[uid]
+        
+        zf = self._get_zip(zpath)
+        with zf.open(internal_name) as f:
+            data = torch.load(io.BytesIO(f.read()), weights_only=False)
 
         point = {
             "coord": data["coord"].numpy() if isinstance(data["coord"], torch.Tensor) else data["coord"],
@@ -198,7 +228,7 @@ class Cap3DDataset(Dataset):
             "normal": data.get("normal", np.zeros((len(data["coord"]), 3), dtype=np.float32)),
         }
 
-        # Subsample if too many points
+        # Subsample if too many points to avoid OOM
         N = point["coord"].shape[0]
         if N > self.max_points:
             idx_sample = np.random.choice(N, self.max_points, replace=False)
