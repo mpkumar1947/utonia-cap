@@ -189,10 +189,14 @@ class UtoniaCap(nn.Module):
         llm_embed = self.llm.get_input_embeddings()
         prompt_embeds = llm_embed(prompt_ids)  # [1, prompt_len, 1536]
 
+        # Cast geometry tokens to match LLM dtype (bfloat16) — projector outputs float32
+        geo_tokens = geo_tokens.to(dtype=prompt_embeds.dtype)
+
         # Step 3: Concatenate [prompt] + [geometry tokens] as input
         # The LLM "reads" the geometry tokens as if they were words
         input_embeds = torch.cat([prompt_embeds, geo_tokens], dim=1)
         # Shape: [1, prompt_len + 32, 1536]
+
 
         if caption_ids is not None:
             # ── Training Mode ─────────────────────────────────────────────
