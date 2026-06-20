@@ -225,15 +225,34 @@ class Cap3DDataset(Dataset):
         import io
         uid, caption = self.items[idx]
         zpath, internal_name = self.uid_to_zip[uid]
-        
+
         zf = self._get_zip(zpath)
         with zf.open(internal_name) as f:
             data = torch.load(io.BytesIO(f.read()), weights_only=False)
 
+        # Cap3D stores point clouds as a raw (N, 6) tensor: XYZ + RGB
+        # Some versions store as dict with 'coord'/'color' keys
+        if isinstance(data, torch.Tensor):
+            coord = data[:, :3].numpy().astype(np.float32)
+            color = data[:, 3:6].numpy().astype(np.float32) if data.shape[1] >= 6 else np.ones((len(coord), 3), dtype=np.float32)
+            normal = np.zeros((len(coord), 3), dtype=np.float32)
+        elif isinstance(data, dict):
+            coord = data["coord"]
+            if isinstance(coord, torch.Tensor): coord = coord.numpy()
+            coord = np.asarray(coord, dtype=np.float32)
+            color = data.get("color", np.ones((len(coord), 3), dtype=np.float32))
+            if isinstance(color, torch.Tensor): color = color.numpy()
+            color = np.asarray(color, dtype=np.float32)
+            normal = data.get("normal", np.zeros((len(coord), 3), dtype=np.float32))
+            if isinstance(normal, torch.Tensor): normal = normal.numpy()
+            normal = np.asarray(normal, dtype=np.float32)
+        else:
+            raise ValueError(f"Unknown Cap3D data format: {type(data)}")
+
         point = {
-            "coord": data["coord"].numpy() if isinstance(data["coord"], torch.Tensor) else data["coord"],
-            "color": data.get("color", np.ones((len(data["coord"]), 3), dtype=np.float32)),
-            "normal": data.get("normal", np.zeros((len(data["coord"]), 3), dtype=np.float32)),
+            "coord":  coord,
+            "color":  color,
+            "normal": normal,
         }
 
         # Subsample if too many points to avoid OOM
