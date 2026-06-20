@@ -163,9 +163,17 @@ class Cap3DDataset(Dataset):
         # 1. Load captions CSV
         caption_file = os.path.join(data_dir, f"Cap3D_automated_Objaverse_no3Dword_{split}.csv")
         if not os.path.exists(caption_file):
-            alt_path = os.path.join(data_dir, "Cap3D_automated_Objaverse_no3Dword.csv")
-            if os.path.exists(alt_path):
-                caption_file = alt_path
+            # Try alternative CSV names (HF dataset structure may vary)
+            for alt_name in [
+                "Cap3D_automated_Objaverse_no3Dword.csv",
+                "Cap3D_automated_Objaverse_full.csv",
+                "Cap3D_automated_Objaverse.csv",
+            ]:
+                alt_path = os.path.join(data_dir, alt_name)
+                if os.path.exists(alt_path):
+                    caption_file = alt_path
+                    print(f"  Using caption file: {alt_name}")
+                    break
             else:
                 print(f"Warning: Cap3D caption CSV not found in {data_dir}. Ensure it is downloaded.")
                 caption_file = None
