@@ -141,17 +141,21 @@ class UtoniaCap(nn.Module):
         Returns:
             geo_tokens: [1, num_queries, LLM_DIM]
         """
-        with torch.no_grad() if not self.projector.training else torch.enable_grad():
-            # Forward through Utonia — hook captures bottleneck automatically
-            with torch.inference_mode():
-                self.utonia(point_dict)
+        # Use no_grad (NOT inference_mode) so captured features can flow through
+        # the trainable projector. inference_mode permanently marks tensors as
+        # non-differentiable, which breaks autograd in the projector.
+        with torch.no_grad():
+            self.utonia(point_dict)
+
+        # Clone bottleneck features so they are detached from no_grad context
+        # but still allow gradient flow through the projector
+        feats = self._bottleneck_feats.detach().clone().requires_grad_(False)
+        offset = self._bottleneck_offset
 
         # Projector is always trainable (has gradients)
-        geo_tokens = self.projector(
-            self._bottleneck_feats,
-            self._bottleneck_offset,
-        )
+        geo_tokens = self.projector(feats, offset)
         return geo_tokens  # [1, 32, 1536]
+
 
     def forward(
         self,
