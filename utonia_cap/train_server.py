@@ -37,6 +37,13 @@ def train_server(args):
         print("ERROR: Dataset is empty! Check the data_dir path and CSV file.")
         return
 
+    # Optionally cap the dataset size for practical training time
+    if args.max_samples and args.max_samples < len(dataset):
+        import random
+        indices = random.sample(range(len(dataset)), args.max_samples)
+        dataset = torch.utils.data.Subset(dataset, indices)
+        print(f"Capped dataset to {args.max_samples:,} random samples")
+
     # num_workers=0 avoids multiprocessing issues with zip file handles
     dataloader = DataLoader(
         dataset,
@@ -149,5 +156,6 @@ if __name__ == "__main__":
     parser.add_argument("--accumulate",  type=int,   default=16)
     parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--max_points",  type=int,   default=60000)
+    parser.add_argument("--max_samples", type=int, default=100000, help="Max training samples per epoch (default 100K)")
     args = parser.parse_args()
     train_server(args)
