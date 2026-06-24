@@ -81,10 +81,30 @@ def train_server(args):
     # 4. Training Loop
     os.makedirs(args.out_dir, exist_ok=True)
     accumulation_steps = args.accumulate
+
+    # Resume from a saved checkpoint if specified
+    start_epoch = 0
+    if args.resume_epoch > 0:
+        proj_path = os.path.join(args.out_dir, f"projector_server_epoch{args.resume_epoch}.pt")
+        lora_path = os.path.join(args.out_dir, "lora_adapter_server")
+        if os.path.exists(proj_path):
+            model.projector.load_state_dict(torch.load(proj_path, map_location=device))
+            print(f"  ✓ Loaded projector from {proj_path}")
+        else:
+            print(f"  WARNING: Projector checkpoint not found at {proj_path}")
+        if os.path.exists(lora_path):
+            from peft import PeftModel
+            model.llm = PeftModel.from_pretrained(model.llm.base_model.model, lora_path, is_trainable=True)
+            print(f"  ✓ Loaded LoRA adapter from {lora_path}")
+        else:
+            print(f"  WARNING: LoRA adapter not found at {lora_path}")
+        start_epoch = args.resume_epoch
+        print(f"  Resuming from epoch {start_epoch + 1}")
+
     print(f"\nStarting training: {args.epochs} epochs, batch_size={args.batch_size}, "
           f"grad_accum={accumulation_steps} (effective batch={args.batch_size * accumulation_steps})")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         total_loss = 0.0
         n_batches = 0
         optimizer.zero_grad()
@@ -146,7 +166,7 @@ def train_server(args):
         avg_str = f"{avg_loss:.4f}" if avg_loss == avg_loss else "nan (check for OOM cascades)"
         print(f"\n✓ Epoch {epoch+1} complete. Avg Loss: {avg_str}")
 
-        # Save checkpoint
+        # Save checkpoint with absolute epoch number
         proj_path = os.path.join(args.out_dir, f"projector_server_epoch{epoch+1}.pt")
         lora_path = os.path.join(args.out_dir, "lora_adapter_server")
         torch.save(model.projector.state_dict(), proj_path)
@@ -166,7 +186,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size",  type=int,   default=1)
     parser.add_argument("--accumulate",  type=int,   default=16)
     parser.add_argument("--lr",          type=float, default=1e-4)
-    parser.add_argument("--max_points",  type=int,   default=60000)
-    parser.add_argument("--max_samples", type=int, default=100000, help="Max training samples per epoch (default 100K)")
+    parser.add_argument("--max_points",  type=int,   default=20000)
+    parser.add_argument("--max_samples", type=int,   default=100000, help="Max training samples per epoch (default 100K)")
+    parser.add_argument("--resume_epoch",type=int,   default=0,      help="Resume from this epoch number (e.g. 2 loads epoch2 checkpoint)")
     args = parser.parse_args()
     train_server(args)
