@@ -8,6 +8,7 @@ Runs on GPU 0 with gradient accumulation to simulate large batches.
 import os
 import sys
 import argparse
+import gc
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -45,13 +46,14 @@ def train_server(args):
         print(f"Capped dataset to {args.max_samples:,} random samples")
 
     # num_workers=0 avoids multiprocessing issues with zip file handles
+    # pin_memory=False reduces RAM/swap pressure over long runs
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=False,
     )
     print(f"Dataloader ready: {len(dataset):,} objects, {len(dataloader):,} batches/epoch")
 
@@ -128,12 +130,21 @@ def train_server(args):
                 if "out of memory" in str(e).lower():
                     print(f"\nOOM on step {step}. Skipping batch and clearing cache.")
                     torch.cuda.empty_cache()
+                    gc.collect()
                     optimizer.zero_grad()
                 else:
                     raise e
 
-        avg_loss = total_loss / max(n_batches, 1)
-        print(f"\n✓ Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
+            # Periodic full garbage collection every 500 steps
+            # Prevents PyTorch allocator cache from slowly filling swap
+            if step % 500 == 0 and step > 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # Filter out any NaN values before averaging
+        avg_loss = total_loss / max(n_batches, 1) if n_batches > 0 else float('nan')
+        avg_str = f"{avg_loss:.4f}" if avg_loss == avg_loss else "nan (check for OOM cascades)"
+        print(f"\n✓ Epoch {epoch+1} complete. Avg Loss: {avg_str}")
 
         # Save checkpoint
         proj_path = os.path.join(args.out_dir, f"projector_server_epoch{epoch+1}.pt")
