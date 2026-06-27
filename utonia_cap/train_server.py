@@ -9,6 +9,7 @@ import os
 import sys
 import argparse
 import gc
+import json
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -84,7 +85,27 @@ def train_server(args):
 
     # Resume from a saved checkpoint if specified
     start_epoch = 0
-    if args.resume_epoch > 0:
+    start_step = 0
+    
+    # Check for a mid-epoch checkpoint first (highest priority)
+    mid_proj_path = os.path.join(args.out_dir, "projector_server_latest.pt")
+    mid_lora_path = os.path.join(args.out_dir, "lora_adapter_latest")
+    step_file = os.path.join(args.out_dir, "latest_step.json")
+    
+    if os.path.exists(step_file) and os.path.exists(mid_proj_path):
+        with open(step_file, 'r') as f:
+            state = json.load(f)
+            start_epoch = state['epoch']
+            start_step = state['step']
+            
+        print(f"\nFound MID-EPOCH checkpoint! Resuming Epoch {start_epoch+1} at Step {start_step}...")
+        model.projector.load_state_dict(torch.load(mid_proj_path, map_location=device))
+        
+        from peft import PeftModel
+        model.llm = PeftModel.from_pretrained(model.llm.base_model.model, mid_lora_path, is_trainable=True)
+        print(f"  ✓ Loaded projector & LoRA from mid-epoch backup")
+        
+    elif args.resume_epoch > 0:
         proj_path = os.path.join(args.out_dir, f"projector_server_epoch{args.resume_epoch}.pt")
         lora_path = os.path.join(args.out_dir, "lora_adapter_server")
         if os.path.exists(proj_path):
@@ -99,7 +120,7 @@ def train_server(args):
         else:
             print(f"  WARNING: LoRA adapter not found at {lora_path}")
         start_epoch = args.resume_epoch
-        print(f"  Resuming from epoch {start_epoch + 1}")
+        print(f"  Resuming from the beginning of epoch {start_epoch + 1}")
 
     print(f"\nStarting training: {args.epochs} epochs, batch_size={args.batch_size}, "
           f"grad_accum={accumulation_steps} (effective batch={args.batch_size * accumulation_steps})")
@@ -109,8 +130,17 @@ def train_server(args):
         n_batches = 0
         optimizer.zero_grad()
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{start_epoch + args.epochs}")
         for step, (point_dict, captions) in enumerate(pbar):
+            # Fast-forward dataloader if we are resuming mid-epoch
+            if step < start_step:
+                if step % 1000 == 0:
+                    pbar.set_postfix(skip=f"Skipping to step {start_step}...")
+                continue
+            
+            # Reset start_step so future epochs don't skip
+            if step == start_step:
+                start_step = 0
             # Move point cloud tensors to GPU
             for k, v in point_dict.items():
                 if isinstance(v, torch.Tensor):
@@ -145,6 +175,12 @@ def train_server(args):
                     loss=f"{loss.item() * accumulation_steps:.4f}",
                     gpu=f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
                 )
+                
+                # Aggressively free memory at the end of every step
+                del loss
+                del point_dict
+                del caption_enc
+                del caption_ids
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -156,10 +192,17 @@ def train_server(args):
                     raise e
 
             # Periodic full garbage collection every 500 steps
-            # Prevents PyTorch allocator cache from slowly filling swap
             if step % 500 == 0 and step > 0:
                 gc.collect()
                 torch.cuda.empty_cache()
+                
+            # MID-EPOCH CHECKPOINT: Save progress every 5,000 steps so we don't lose work if killed
+            if step % 5000 == 0 and step > 0:
+                torch.save(model.projector.state_dict(), mid_proj_path)
+                model.llm.save_pretrained(mid_lora_path)
+                with open(step_file, 'w') as f:
+                    json.dump({'epoch': epoch, 'step': step + 1}, f)
+                pbar.set_postfix(saved=f"Backup step {step}")
 
         # Filter out any NaN values before averaging
         avg_loss = total_loss / max(n_batches, 1) if n_batches > 0 else float('nan')
@@ -173,6 +216,10 @@ def train_server(args):
         model.llm.save_pretrained(lora_path)
         print(f"  Saved → {proj_path}")
         print(f"  Saved → {lora_path}/")
+        
+        # Clear mid-epoch backup since we successfully completed the epoch
+        if os.path.exists(step_file):
+            os.remove(step_file)
 
     print("\n✓ Training complete!")
 
